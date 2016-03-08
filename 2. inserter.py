@@ -7,6 +7,9 @@ from os.path import isfile, join
 import re
 import numpy as np
 import json
+import os
+from pymongo.errors import BulkWriteError
+from pprint import pprint
 
 #rename files in archives
 def rename_elements_in_archives(file_path, slash):
@@ -150,97 +153,149 @@ def clean_csv(path_to_files):
         cleaned.write(data.replace('\x00', ''))
         cleaned.close()
 
+
+#write collected list of files
+def write_list(path_to_files):
+    if os.path.isfile(path_to_files+'_symbol_list.txt'):
+        pass
+    else:
+        print "There isn't such file, so we'll collect filenames into it."
+        #collect files
+        k = collect_cleaned_bones(path_to_files)
+        with open(path_to_files+'_symbol_list.txt', 'w') as file_list:
+            for ki in k:
+                file_list.write(ki+"\r\n")
+        file_list.close()
+
+
+#connect
+def connect_to_mongo(dbname):
+    client = MongoClient()
+    db = client[dbname]
+    return db
+
+
+#put data into mongoDB
+def put_data(data, db, tableName):
+    try:
+                #add unique indexes
+        db[tableName].create_index([('TID', pymongo.ASCENDING)], unique=True)
+        db[tableName].create_index([('DATE_TIME', pymongo.ASCENDING)], unique=False)
+
+        n = 0
+        #get order of columns
+        for c in data.columns:
+            #get column number of datetime
+            if(data[c].dtype == np.object):
+                if len(data.ix[2][n]) > 18:
+                    timecol = n
+            
+            #get column number of bud and ask
+            if(data[c].dtype == np.float64): 
+                bidcol = n-1
+                askcol = n
+                if data.ix[2][bidcol] < data.ix[2][askcol]:
+                    bidcol = n-1
+                    askcol = n
+                else:
+                    bidcol = None
+                    askcol = None
+                
+            #check for tid column number
+            if(data[c].dtype == np.int64):
+                tidcol = n
+            n += 1
+                
+        timerows = data[data.columns[timecol]]
+        bidrows = data[data.columns[bidcol]]
+        askrows = data[data.columns[askcol]]
+        tidrows = data[data.columns[tidcol]]
+            
+        #full corrected dataframe
+        corrected_form = pd.concat([timerows, bidrows, askrows, tidrows], axis=1, keys=["DATE_TIME", "BID", "ASK", "TID"])#, join_axes=[timerows])
+            
+        #set time series based index
+        corrected_form.set_index(keys="DATE_TIME", inplace=False)
+    
+        #convert strings to pandas DateTimeIndex
+        corrected_form.DATE_TIME = pd.to_datetime(corrected_form.DATE_TIME, format='%Y-%m-%d %H:%M:%S.%f')
+    
+        #try to insert at once
+        rec = json.loads(corrected_form.T.to_json(date_format='iso8601', double_precision=6, date_unit='ns')).values()
+        
+        #db[tableName].insert(rec, continue_on_error=True)
+        db[tableName].insert_many(rec, ordered=False, bypass_document_validation=False)
+    except BulkWriteError as bwe:
+        pprint(bwe) #.bwe.details
+
 #script body
 def main():
 
     scriptStart = time.time()
     
     #config
-    path_to_files = "D:\\data\\fx\\"
+    path_to_files = os.path.abspath("D:/data/fx/")
     dbname = 'lean'
     
     #establish connection to mongo
-    client = MongoClient()    
-    db = client[dbname]
+    #client = MongoClient()    
+    db = connect_to_mongo(dbname)
     
+    '''
     #do all required stuff before dealing with dbase
     rename_elements_in_archives(path_to_files, False)
     unzip(path_to_files, False)
     unzip(path_to_files, True)
     clean_csv(path_to_files)
-        
-    #collect files
-    k = collect_cleaned_bones(path_to_files)
+    '''
+    
+    write_list(path_to_files)
+    
     m = 0
     
-    #do insert magic
-    for s in range(0, len(k)):
-        print "------------------------------"
-        print m
-        print k[s]
-        m += 1
-        tableName = clean_name(k[s])+"_ticks"
+    with open(path_to_files+'_symbol_list.txt', 'r') as datfl:
+        filelist = datfl.readlines()
+        #print filelist
         
-        #create collection
-        rows = db[tableName]
+        for li in filelist:
+            try:
+                file_toparse = li[:-2] #clip new line
         
-        data = pd.read_csv(k[s], sep=',')
+                print "------------------------------"
+                print m
+                m += 1
+                print file_toparse
+                tableName = clean_name(file_toparse)+"_ticks"
+                print tableName
         
-        #add unique indexes
-        db[tableName].create_index([('TID', pymongo.ASCENDING)], unique=True)
-        db[tableName].create_index([('DATE_TIME', pymongo.ASCENDING)], unique=False)
+                #create collection
+                rows = db[tableName]
         
-        try:
-            #get order of columns
-            n = 0
-            for c in data.columns:
-                #get column number of datetime
-                if(data[c].dtype == np.object):
-                    if len(data.ix[2][n]) > 18:
-                        timecol = n
-            
-                #get column number of bud and ask
-                if(data[c].dtype == np.float64): 
-                    bidcol = n-1
-                    askcol = n
-                    if data.ix[2][bidcol] < data.ix[2][askcol]:
-                        bidcol = n-1
-                        askcol = n
-                    else:
-                        bidcol = None
-                        askcol = None
+                data = pd.read_csv(file_toparse, sep=',')
                 
-                #check for tid column number
-                if(data[c].dtype == np.long):
-                    if data.ix[2][n] > 1000000:
-                        tidcol = n
+                #put data into Mongo
+                put_data(data, db, tableName)
+            
+                #write new list of data files
+                datfl.close()
+                cnt = 0
+                with open(path_to_files+'_symbol_list.txt', 'w') as datfl:
+                    for ki in filelist[m:]:
+                        datfl.write(ki)
+                        cnt += 1
+                datfl.close()
                 
-                n += 1
+                datfl = open(path_to_files+'_symbol_list.txt', 'r')
                 
-            timerows = data[data.columns[timecol]]
-            bidrows = data[data.columns[bidcol]]
-            askrows = data[data.columns[askcol]]
-            tidrows = data[data.columns[tidcol]]
+                
+                print "New length %s" %cnt
+                print "Passed"
             
-            #full corrected dataframe
-            corrected_form = pd.concat([timerows, bidrows, askrows, tidrows], axis=1, keys=["DATE_TIME", "BID", "ASK", "TID"])#, join_axes=[timerows])
-            
-            #set time series based index
-            corrected_form.set_index(keys="DATE_TIME", inplace=False)
-    
-            #convert strings to pandas DateTimeIndex
-            corrected_form.DATE_TIME = pd.to_datetime(corrected_form.DATE_TIME, format='%Y-%m-%d %H:%M:%S.%f')
-    
-            #try to insert at once
-            rec = json.loads(corrected_form.T.to_json(date_format='iso8601', double_precision=6, date_unit='ns')).values()
-            db[tableName].insert(rec)
-            print "Passed"
-            
-        except Exception as e:
-            print e
+            except Exception as e:
+                print e
         
+    datfl.close()
     timeused = (time.time()-scriptStart)/60
     print "Done in %s minutes" %round(timeused,2) 
-    
     
 main()
